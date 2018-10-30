@@ -54,7 +54,8 @@ struct interface{
 u_short Checksum(u_short *buf, int count);
 int Send_ARP_Reply(char *data, unsigned char my_mac_address[6], int current_socket);
 int Send_ARP_Request(char * host_ip, unsigned char my_mac_address[6],char * dest_ip, int socket);
-int Wait_For_Reply(char * ip, char * buf, int current_socket,unsigned char my_mac_address[6], int packet_size);
+int Forward_IP_Packet(char * buf, int current_socket,unsigned char my_mac_address[6], int packet_size);
+int Send_ICMP_Error(unsigned char my_mac_address[6], int current_socket,int type_of_error,struct in_addr my_ip);
 
 int main(){
 
@@ -149,6 +150,7 @@ int main(){
             }
         }
     }
+
 //================================================================
 //reading in the routing table
 //================================================================
@@ -228,7 +230,7 @@ int main(){
                         //find the sockets MAC addr and place it into my_mac_addr
                         temp_interface = interfaces[i];
                         break;
-                    }	
+                    }   
                 }
                 //set our mac address for late access
                 memcpy(my_mac_addr, temp_interface.mac_addr,6);
@@ -254,15 +256,7 @@ int main(){
                             printf("Error send ARP");
                             continue;
                         }
-                    }else if(htons(arp->opcode) == 2){
-                        printf("\n..... ARP reply ..... \n\n");
-
-                        //check if there is anything in the queue for the replier
-                        // memcpy(eth->h_source, thisMac, 6);
-                        // memcpy(eth->h_dest, arp->arp_smac, 6);
-                        //send(socket, buf, packetSize, 0);
                     }
-
 
 //================================================================
 //if the incoming data is IP
@@ -283,18 +277,37 @@ int main(){
                     struct iphdr *ip = (struct iphdr *) (buf + sizeof(struct ether_header));
                     int itr;
 
-					//This loop will check to see if the destination IP is one of our IP address.
+                    if (Checksum((u_short*)ip, 10) != 0) {
+                        printf("Wrong checksum, dropping packet\n");
+                        continue;
+                    }
+                    printf("Checksum verified. TTL:%d \n",ip->ttl);
+
+                    
+                    
+
+                    //This loop will check to see if the destination IP is one of our IP address.
                     int my_ip_check = 0;
-					struct in_addr current_ip_socket;
-					for (itr = 0; itr < counter; itr++) {
+                    struct in_addr current_ip_socket;
+                    for (itr = 0; itr < counter; itr++) {
                         //check to see if the IP is in our list of addresses
-						if (list_of_ips[itr]->s_addr == ip->daddr) {
-							my_ip_check = 1;
-							current_ip_socket = *list_of_ips[itr];
-							printf("%s belongs to us\n", inet_ntoa(current_ip_socket));
-							break;
-						}
-					}
+                        if (list_of_ips[itr]->s_addr == ip->daddr) {
+                            my_ip_check = 1;
+                            current_ip_socket = *list_of_ips[itr];
+                            printf("%s belongs to us\n", inet_ntoa(current_ip_socket));
+                            break;
+                        }
+                    }
+
+                    //TTL decrement the ttl
+                    ip->ttl = ip->ttl - 1;
+                    
+                    if(ip->ttl < 1){
+                        printf("ttl is 0, dropping packet\n");
+                        Send_ICMP_Error(my_mac_addr,current_socket,1,current_ip_socket); //TTL exceded
+                    }
+
+                    printf("ttl updated to %d\n",ip->ttl);
                      
                     if(my_ip_check == 0){
                         //this is the destination of the IP packet
@@ -346,13 +359,17 @@ int main(){
                                     if(!ret_val){
                                         printf("ARP request sent\nIP packet added to queue\n");
 
+                                        int ARP_request_response = Forward_IP_Packet(buf,interfaces[itr].socket,my_mac_addr,packet_size );
                                         
-                                        if(Wait_For_Reply(dest_ip2,buf,interfaces[itr].socket,my_mac_addr,packet_size )){
-                                            printf("ARP Reply not received. Dropping packet.");
+                                        if( ARP_request_response == 1){
+                                            printf("ARP Reply not received.");
+                                            Send_ICMP_Error(my_mac_addr,current_socket,2,current_ip_socket);//host unreachable
+                                            break;
+                                        }else if (ARP_request_response == 0){
+                                            printf("IP packet forwarded to %s\n",dest_ip2);
+                                            break;
                                         }
 
-                                        printf("IP packet forwarded to %s\n",dest_ip2);
-                                        break;
 
                                     }else if(ret_val == 1){
                                         printf("Error sending ARP request");
@@ -364,6 +381,7 @@ int main(){
 
                         }else if(rt_match == 0){
                             printf("IP dest not in network, dropping packet.\n");
+                            Send_ICMP_Error(my_mac_addr,current_socket,3,current_ip_socket); //network unreachable
                             continue;
                         }
                     }
@@ -423,6 +441,7 @@ int main(){
             }   
         }
     }
+
     //free the interface list when we don't need it anymore
     freeifaddrs(ifaddr);
     //exit
@@ -453,11 +472,11 @@ int Send_ARP_Request(char * host_ip ,unsigned char my_mac_address[6], char * des
 
     //broadcast mac address
     eth_to_send->ether_dhost[0] = 0xFFU;
-	eth_to_send->ether_dhost[1] = 0xFFU;
-	eth_to_send->ether_dhost[2] = 0xFFU;
-	eth_to_send->ether_dhost[3] = 0xFFU;
-	eth_to_send->ether_dhost[4] = 0xFFU;
-	eth_to_send->ether_dhost[5] = 0xFFU;
+    eth_to_send->ether_dhost[1] = 0xFFU;
+    eth_to_send->ether_dhost[2] = 0xFFU;
+    eth_to_send->ether_dhost[3] = 0xFFU;
+    eth_to_send->ether_dhost[4] = 0xFFU;
+    eth_to_send->ether_dhost[5] = 0xFFU;
 
     //ethernet source host MAC address
     memcpy(eth_to_send->ether_shost,my_mac_address,6);
@@ -483,23 +502,23 @@ int Send_ARP_Request(char * host_ip ,unsigned char my_mac_address[6], char * des
 
     //sender ip address
     arp_to_send->s_proto_addr[0] = (unsigned char)(host.s_addr) & 0xFFU;
-	arp_to_send->s_proto_addr[1] = (unsigned char)(host.s_addr >> 8) & 0xFFU;
-	arp_to_send->s_proto_addr[2] = (unsigned char)(host.s_addr >> 16) & 0xFFU;
-	arp_to_send->s_proto_addr[3] = (unsigned char)(host.s_addr >> 24) & 0xFFU;
+    arp_to_send->s_proto_addr[1] = (unsigned char)(host.s_addr >> 8) & 0xFFU;
+    arp_to_send->s_proto_addr[2] = (unsigned char)(host.s_addr >> 16) & 0xFFU;
+    arp_to_send->s_proto_addr[3] = (unsigned char)(host.s_addr >> 24) & 0xFFU;
 
     //Broadcast address
     arp_to_send->d_hard_addr[0] = 0xFFU;
-	arp_to_send->d_hard_addr[1] = 0xFFU;
-	arp_to_send->d_hard_addr[2] = 0xFFU;
-	arp_to_send->d_hard_addr[3] = 0xFFU;
-	arp_to_send->d_hard_addr[4] = 0xFFU;
-	arp_to_send->d_hard_addr[5] = 0xFFU;
+    arp_to_send->d_hard_addr[1] = 0xFFU;
+    arp_to_send->d_hard_addr[2] = 0xFFU;
+    arp_to_send->d_hard_addr[3] = 0xFFU;
+    arp_to_send->d_hard_addr[4] = 0xFFU;
+    arp_to_send->d_hard_addr[5] = 0xFFU;
 
     //Destination IP address
     arp_to_send->d_proto_addr[0] = (unsigned char)(dest.s_addr) & 0xFFU;
-	arp_to_send->d_proto_addr[1] = (unsigned char)(dest.s_addr >> 8) & 0xFFU;
-	arp_to_send->d_proto_addr[2] = (unsigned char)(dest.s_addr >> 16) & 0xFFU;
-	arp_to_send->d_proto_addr[3] = (unsigned char)(dest.s_addr >> 24) & 0xFFU;
+    arp_to_send->d_proto_addr[1] = (unsigned char)(dest.s_addr >> 8) & 0xFFU;
+    arp_to_send->d_proto_addr[2] = (unsigned char)(dest.s_addr >> 16) & 0xFFU;
+    arp_to_send->d_proto_addr[3] = (unsigned char)(dest.s_addr >> 24) & 0xFFU;
 
     //send the request
     int send_error = send(current_socket,request,42,0);
@@ -564,7 +583,13 @@ int Send_ARP_Reply(char *data, unsigned char my_mac_address[6], int current_sock
     return(0);
 }
 
-int Wait_For_Reply(char *ip, char*buf, int current_socket, unsigned char my_mac_address[6],int packet_size){
+/*================================================================
+* Forward_IP_Packet
+* about
+* Parameters
+* return
+=================================================================*/
+int Forward_IP_Packet(char*buf, int current_socket, unsigned char my_mac_address[6],int packet_size){
 
     char temp_buf[1500]; 
     int n = recv(current_socket, temp_buf, 1500, 0);
@@ -586,6 +611,11 @@ int Wait_For_Reply(char *ip, char*buf, int current_socket, unsigned char my_mac_
         memcpy(eth->ether_dhost,temp_eth->ether_shost,6);
         memcpy(eth->ether_dhost,temp_eth->ether_shost,6);
 
+        //update the checksum
+        struct iphdr *ip = (struct iphdr *) (buf + sizeof(struct ether_header));
+        ip->check = 0x0000U;
+        ip->check = Checksum((u_short*)ip,10);
+        printf("updated checksum:%u\n",ip->check);
 
         if(send(current_socket,buf,packet_size,0)<0){
             printf("Error forwarding packet");
@@ -602,14 +632,70 @@ int Wait_For_Reply(char *ip, char*buf, int current_socket, unsigned char my_mac_
 * return
 =================================================================*/
 u_short Checksum(u_short *buf, int count) {
-	register u_long sum = 0;
+    register u_long sum = 0;
 
-	while (count--) {
-		sum += *buf++;
-		if (sum & 0xFFFF0000) {
-			sum &= 0xFFFF;
-			sum++;
-		}
-	}
-	return ~(sum & 0xFFFF);
+    while (count--) {
+        sum += *buf++;
+        if (sum & 0xFFFF0000) {
+            sum &= 0xFFFF;
+            sum++;
+        }
+    }
+    return ~(sum & 0xFFFF);
+}
+
+/*================================================================
+* Send_ICMP_Error
+* about nws
+* Parameters
+* return
+=================================================================*/
+
+//1 = ttl exception
+//2 = host unreachable
+//3 = network unreachable
+int Send_ICMP_Error(unsigned char my_mac_address[6], int current_socket,int type_of_error,struct in_addr my_ip){
+    char error[42];
+
+    //construct the ethernet header
+    struct ether_header* eth = (struct ether_header*) error;
+
+    memcpy(eth->ether_dhost, eth->ether_shost, 6);
+    memcpy(eth->ether_shost, my_mac_address, 6);
+    eth->ether_type = ntohs(0x0800);
+
+    //construct the ip header
+    struct iphdr* ip = (struct iphdr*) (error + sizeof(struct ether_header));
+    ip->ihl = 5;
+    ip->tos = 0;
+    ip->tot_len = 42;
+    ip->id = ip->id + 1;
+    ip->frag_off = 0;
+    ip->ttl = 64;
+    ip->protocol = 1;
+    ip->check = 0;
+    ip->saddr = my_ip.s_addr;
+    ip->daddr = ip->saddr;
+
+    //construct the icmp header
+    struct icmphdr* icmp = (struct icmphdr*)(error + sizeof(struct ether_header)+ sizeof(struct iphdr));
+
+    if(type_of_error == 1){
+        icmp->type = ICMP_TIMXCEED;
+        icmp->code = ICMP_TIMXCEED_INTRANS;
+    }else if(type_of_error == 2){
+        icmp->type = ICMP_UNREACH;
+        icmp->code = ICMP_UNREACH_HOST;
+    }else if(type_of_error == 3){
+        icmp->type = ICMP_DEST_UNREACH;
+        icmp->code = ICMP_NET_UNREACH;
+    }
+
+    //update the checksum
+    ip->check = Checksum((u_short*)ip, 10);
+    icmp->checksum = Checksum((u_short*)icmp, 10);
+
+    send(current_socket, error, 42, 0);
+
+    return 0;
 }
